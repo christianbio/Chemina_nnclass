@@ -193,4 +193,6 @@ module molneural_data
    logical, dimension(8192) :: use_type
    logical calc_forces
 
+   real(8), dimension(8192) :: energy_pred_store
+
 end module molneural_data

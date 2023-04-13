@@ -317,7 +317,8 @@ module networks_mod
          integer ns, iatom, ivec, itype, i, j
          real(8) :: ffac, efac, ffac_val,efac_val,delta_energy,nfac
          integer layer,m,m1,m2,m3,id1,id2,id_center,nc_used,cindex,etype,struct_id
-         integer frag_id,nfrag,nf
+         integer frag_id,nfrag,nf,ns2
+         integer, allocatable, dimension(:) :: perm_step
          
          real(8) :: energy_pred,frac,var_est
          real(8), allocatable, dimension(:) :: charge_pred
@@ -349,10 +350,22 @@ module networks_mod
 
          real(8) :: mult
          real(8) :: net_timing
+         real(8) :: const,rand
+         real(8), dimension(8192) :: energy_store         
 
-         
          !only calculate the validation error once every 10 steps
          calc_valid = .true.
+
+         if(minmode.eq.'none') then 
+            energy_pred_store = 0.0d0 
+         endif
+
+         if(minmode.eq.'energy') then 
+            do ns = 1,nsteps_total
+               energy_store(ns) = energy_pred_store(ns)
+            end do
+         endif
+
          if(mod(nminsteps+1,20).ne.0) calc_valid = .false.
          if(nminsteps.eq.0) calc_valid = .true.
          if(restart_calc_valid) then
@@ -392,6 +405,20 @@ module networks_mod
             end do
          end do 
          
+         allocate(perm_step(nsteps_total))
+         perm_step = 0 
+         ns = 1
+         do while(.true.)
+            call random_number(rand)
+            ns2 = int(rand * nsteps_total) + 1
+            if(perm_step(ns2).eq.0) then 
+               perm_step(ns2) = ns
+!               write(*,*) 'aa',ns,ns2
+               ns = ns + 1
+            endif
+            if(ns.eq.nsteps_total+1) exit
+         end do
+
          error2_force = 0.0d0
          error2_energy = 0.0d0
 
@@ -419,8 +446,8 @@ module networks_mod
          !$OMP         denergy_dconst, &
          !$OMP         dforce_dw1, dforce_dw2, dforce_dw3, dforce_db1,dforce_db2, &
          !$OMP         dforce_dw, dforce_db, &
-         !$OMP         var_est,mult,frag_id,nf,nfrag,struct_id,&
-         !$OMP         efac,frac)
+         !$OMP         var_est,mult,const,frag_id,nf,nfrag,struct_id,&
+         !$OMP         efac,frac,ns,ns2,nfac)
 
 
          allocate(denergy_dw1(mnet_size(1),ncols_wmat1))
@@ -439,46 +466,62 @@ module networks_mod
          allocate(dforce_db(3,mnet_size_max, natoms_max, natom_list,mnet_nlayers))
 
          !$OMP DO REDUCTION(+:error2_energy, error2_force, &
-         !$OMP error2_energy_val, error2_force_val, &
-         !$OMP mnet_de2_dw1,&
-         !$OMP mnet_de2_dw, mnet_de2_db,net_timing)
+         !$OMP error2_energy_val, error2_force_val, mnet_de2_dw1, &
+         !$OMP mnet_de2_dw, mnet_de2_db,mnet_de2_dconst,net_timing,energy_pred_store)
 
          do ns = 1, nsteps_total
+            ns2 = perm_step(ns)
+            nfrag = nfrag_ns(ns2) 
 
-            nfrag = nfrag_ns(ns) 
-
-            if((.not.calc_valid).and.(.not.train_step(ns))) then
+            if((.not.calc_valid).and.(.not.train_step(ns2))) then
                cycle
             endif
 
-            call get_mnet_energy(ns, net_type, &
-                 energy_pred, charge_pred, &
-                 denergy_dw1, denergy_dw, denergy_db, & 
-                 dcharge_dw1, dcharge_dw, dcharge_db, &
-                 dforce_dw1, dforce_dw, dforce_db, & 
-                 denergy_dconst,force_pred,net_timing)
-            
-            train_energy1(ns) = energy_pred
-!            write(888,*) 'ee',ns,energy_pred
-!            call flush(888)
 
+            calc_forces = .false.
+            if(minmode.eq.'all'.or.minmode.eq.'none') then 
+               calc_forces = .true.
+               call get_mnet_energy(ns2, net_type, &
+                    energy_pred, charge_pred, &
+                    denergy_dw1, denergy_dw, denergy_db, & 
+                    dcharge_dw1, dcharge_dw, dcharge_db, &
+                    dforce_dw1, dforce_dw, dforce_db, & 
+                    denergy_dconst,force_pred,net_timing)
+               energy_pred_store(ns2) = energy_pred_store(ns2) + energy_pred
+            else
+            if(minmode.eq.'energy') energy_pred = energy_store(ns2)
+         endif
+            
+
+
+            denergy_dconst = 0.0d0 
+            do nf = 1,nfrag_ns(ns2)
+               frag_id = frag_id_ns(ns2,nf)
+               mult = frag_mult_ns(ns2,nf)
+               const = mnet_const(frag_id)
+               
+               energy_pred = energy_pred + const * mult
+               denergy_dconst(frag_id) = denergy_dconst(frag_id) + mult
+            end do
+
+            train_energy1(ns2) = energy_pred
             
             ffac = (1.0d0/dble(3*natoms_train))/var_force
             ffac_val = (1.0d0 /dble(3*natoms_val))/var_force
 
-            nfac = 1.0d0 / dble(natoms_step(ns))
-            delta_energy = (energy_pred - train_energy(ns))*nfac
+            nfac = 1.0d0 / dble(natoms_step(ns2))
+            delta_energy = (energy_pred - train_energy(ns2))*nfac
 
             var_est = 0.0d0 
                do nf = 1,nfrag
-                  mult = frag_mult_ns(ns,nf)
-                  frag_id = frag_id_ns(ns,nf)
+                  mult = frag_mult_ns(ns2,nf)
+                  frag_id = frag_id_ns(ns2,nf)
                   var_est = var_est + dble(mult) * var_energy(frag_id)
                end do
 
-            if (train_step(ns)) then
+            if (train_step(ns2)) then
 
-               struct_id = struct_id_ns(ns)
+               struct_id = struct_id_ns(ns2)
                !estimated variance for this structure 
 
                efac = (1.0d0/dble(nsteps_train_struct_id(struct_id)))/var_est
@@ -535,8 +578,8 @@ module networks_mod
                   end do
                end do
 
-                  do nf = 1,nfrag
-                     frag_id = frag_id_ns(ns,nf)               
+                  do nf = 1,nfrag_ns(ns2)
+                     frag_id = frag_id_ns(ns2,nf)               
                      mnet_de2_dconst(frag_id) = mnet_de2_dconst(frag_id) &
                           &            + 2.0d0*delta_energy*denergy_dconst(frag_id)*efac*nfac*frac
                   end do 
@@ -544,13 +587,13 @@ module networks_mod
                   error2_energy = error2_energy + efac*delta_energy**2 * frac
                else
 
-               struct_id = struct_id_ns(ns)
+               struct_id = struct_id_ns(ns2)
                efac_val = (1.0d0 /dble(nsteps_val_struct_id(struct_id)))/var_est
                frac = dble(struct_id_count(struct_id))/dble(nsteps_total)
 
 
                error2_energy_val = error2_energy_val + efac_val*delta_energy**2 * frac
-            end if !if(train_step(ns))
+            end if !if(train_step(ns2))
 
 
             if(calc_forces) then 
@@ -559,13 +602,13 @@ module networks_mod
             !***     FORCES 
             !*****************************************************'
 
-            do iatom = 1, natoms_step(ns)
+            do iatom = 1, natoms_step(ns2)
                do ivec = 1, 3
                   delta_force(ivec, iatom) = (force_pred(ivec, iatom) &
-                       - train_force(ivec, iatom, ns))
-                  train_force1(ivec, iatom, ns) = force_pred(ivec, iatom)
+                       - train_force(ivec, iatom, ns2))
+                  train_force1(ivec, iatom, ns2) = force_pred(ivec, iatom)
 
-                  if (train_step(ns)) then
+                  if (train_step(ns2)) then
                      error2_force = error2_force + ffac*delta_force(ivec, iatom)**2
                   else
                      error2_force_val = error2_force_val + ffac_val*delta_force(ivec, iatom)**2
@@ -573,9 +616,9 @@ module networks_mod
                end do
             end do
 
-            if (train_step(ns)) then
+            if (train_step(ns2)) then
 
-               do iatom = 1,natoms_step(ns)
+               do iatom = 1,natoms_step(ns2)
                   do ivec = 1,3
                      do id_center = 1,natom_list
                         do id1 = 0,natom_list
@@ -613,7 +656,7 @@ module networks_mod
 
                do layer = 1,mnet_nlayers
                   do itype = 1, natom_list
-                     do iatom = 1, natoms_step(ns)
+                     do iatom = 1, natoms_step(ns2)
                         do ivec = 1,3                 
                            if(layer.lt.mnet_nlayers) then 
                               do m1 = 1, mnet_size(layer)
@@ -639,8 +682,6 @@ module networks_mod
                endif
 
             end if
-
-!         write(205,*) ns,dsqrt(e2),fac
 
          end do
          !$OMP END DO
@@ -760,7 +801,6 @@ module networks_mod
          type(net) :: model   
          integer, allocatable, dimension(:) :: size
          real(8) :: yvec2,tiny
-         real(8) :: const
          real(8), dimension(3) :: rr,rr_1,rr_2
          real(8) :: net_timing,start,end
 
@@ -789,8 +829,6 @@ module networks_mod
             dforce_db = 0.0d0 
             dforce_dw = 0.0d0 
             
-            denergy_dconst = 0.0d0 
-
             do iatom = 1, natoms_step(ns)
                force_pred(:, iatom) = 0.0d0
             end do
@@ -1829,19 +1867,6 @@ module networks_mod
 
          end do !do iatom = 1,natoms_step(ns)
 
-         if(net_type.eq.'mnet') then 
-            do nf = 1,nfrag_ns(ns)
-               frag_id = frag_id_ns(ns,nf)
-               mult = frag_mult_ns(ns,nf)
-               const = mnet_const(frag_id)
-
-               energy_pred = energy_pred + const * mult
-               denergy_dconst(frag_id) = denergy_dconst(frag_id) + mult
-            end do
-         endif
-
-         !      write(*,*) 'energy_pred = ',energy_pred
-
 
          !charge neutrality
 
@@ -2644,7 +2669,7 @@ end subroutine allocate
       nprintdata = 1
       
       frprmn_itmax = itmax
-      if(minmode.eq.'energy') frprmn_itmax = 20*0 + 3
+      if(minmode.eq.'energy') frprmn_itmax = 20
       
       if(net_type.eq.'mnet') then 
          write(*, *) 'MINIMIZING MNET WITH ', frprmn_itmax, 'STEPS'
@@ -2970,7 +2995,7 @@ end subroutine allocate
       character(len=32), dimension(0:10) :: tlist
       integer itype, i, j, k, n1, n2, ios, nitems, ii, molmax0,n
       integer nc,ncols,etype,nfid
-      integer atomid_central,id1,id2,cindex,m1,m2,nstruct,frag_id
+      integer atomid_central,id1,id2,cindex,m1,m2,nstruct,frag_id,id
       real(8) :: uu
       character(len=32) :: name, net
       character(len = 3) :: atname,atname1,atname2,atname3
@@ -3078,24 +3103,26 @@ end subroutine allocate
 !            read(22,*) mnet_const(atomid_central)
          end do
             
+         !for putting on a 2nd layer of neurons
 
-!!$         scale = 1000.0d0 
-!!$         do id = 1,natom_list
-!!$            do m1 = 1,mnet_size(1)*0+1
-!!$               do m2 = 1,mnet_size(2)
-!!$                  call random_number(rand)
-!!$                  mnet_w(m2,m1,id,2) = mnet_w(1,m1,id,2) + (rand - 0.5d0)* 0.1d0 * scale
-!!$               end do
-!!$            end do
-!!$         end do
-!!$         mnet_w(:,:,:,2) = mnet_w(:,:,:,2) / scale
-!!$
-!!$         do itype = 1,natom_list
-!!$            do m2 = 1,mnet_size(2)
-!!$               call random_number(rand)
-!!$               mnet_w(1,m2,itype,3) = 4.0d0*scale/mnet_size(2) + (rand - 0.5d0) * 0.1d0 
-!!$            end do 
-!!$         end do
+
+         scale = 1000.0d0 
+         do id = 1,natom_list
+            do m1 = 1,mnet_size(1)
+               do m2 = 1,mnet_size(2)
+                  call random_number(rand)
+                  mnet_w(m2,m1,id,2) = mnet_w(1,m1,id,2) + (rand - 0.5d0)* 0.1d0 
+               end do
+            end do
+         end do
+         mnet_w(:,:,:,2) = mnet_w(:,:,:,2) / scale
+
+         do itype = 1,natom_list
+            do m2 = 1,mnet_size(2)
+               call random_number(rand)
+               mnet_w(1,m2,itype,3) = 4.0d0*scale/mnet_size(2) + (rand - 0.5d0) * 0.1d0 
+            end do 
+         end do
 
 
 
@@ -4499,6 +4526,7 @@ end subroutine eigen
       
       !      call test_coulomb
 !      call test_mnet
+      !stop
 !        call test_mnet_forces
 !        stop
       
