@@ -1,7 +1,7 @@
 stdout out.log
 sumtype
 nnsize 9 5 1
-randomize 0.1d0 
+randomize 0.01d0 
 read mnet
 itmax 32768
 radial_cut 7.0d0 
